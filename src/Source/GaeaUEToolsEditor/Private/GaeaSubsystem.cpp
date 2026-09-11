@@ -37,6 +37,8 @@
 #include "Editor.h"
 #include "LandscapeEditLayer.h"
 #include "LandscapeEdit.h"
+#include "Components/SceneComponent.h"
+#include "LandscapeHeightfieldCollisionComponent.h"
 
 
 #include "Materials/MaterialExpressionLandscapeLayerBlend.h"
@@ -46,6 +48,48 @@
 DEFINE_LOG_CATEGORY(GaeaSubsystem)
 
 #define LOCTEXT_NAMESPACE "GaeaSubsystem"
+
+namespace
+{
+void ApplyReimportScale(ALandscape* Landscape, const FVector& NewScale)
+{
+	FTransform Transform = Landscape->GetActorTransform();
+	const bool bScaleChanged = !Transform.GetScale3D().Equals(NewScale);
+	// Landscape sample 0 is local Z=-256. Keep that height datum fixed when
+	// the Gaea height range changes, including any user translation/rotation.
+	const double HeightOffset = (NewScale.Z - Transform.GetScale3D().Z) * 256.0;
+	Transform.AddToTranslation(Transform.GetRotation().RotateVector(FVector(0, 0, HeightOffset)));
+	Transform.SetScale3D(NewScale);
+
+	Landscape->Modify();
+	Landscape->GetRootComponent()->Modify();
+	Landscape->SetActorTransform(Transform);
+	if (ULandscapeInfo* Info = Landscape->GetLandscapeInfo())
+	{
+		Info->DrawScale = Landscape->GetRootComponent()->GetRelativeScale3D();
+		// Streaming proxies are separate actors. Derive their transforms from
+		// the root and section offsets instead of scaling/moving them separately.
+		Info->FixupProxiesTransform(true);
+		if (bScaleChanged)
+		{
+			// Chaos heightfields bake scale into their physics geometry.
+			Info->ForEachLandscapeProxy([](ALandscapeProxy* Proxy)
+			{
+				for (ULandscapeHeightfieldCollisionComponent* Collision : Proxy->CollisionComponents)
+				{
+					if (Collision)
+					{
+						Collision->RecreateCollision();
+					}
+				}
+				return true;
+			});
+		}
+	}
+	GEngine->BroadcastOnActorMoved(Landscape);
+	Landscape->RequestLayersContentUpdateForceAll(ELandscapeLayerUpdateMode::Update_All);
+}
+}
 
 
 UGaeaSubsystem* UGaeaSubsystem::GetGaeaSubsystem()
@@ -189,7 +233,6 @@ void UGaeaSubsystem::ReimportGaeaTerrain()
 			{
 				UE_LOG(GaeaSubsystem, Display, TEXT("ScaleX: %f, ScaleY: %f, Height: %f, Resolution: %d"), 
 			   GaeaDefinition.ScaleX, GaeaDefinition.ScaleY, GaeaDefinition.Height, GaeaDefinition.Resolution);
-				FVector LandscapeLocation = FVector(0,0,GaeaDefinition.Height*100/2);
 				FVector LandscapeScale = FVector(GaeaDefinition.ScaleX * 100 / GaeaDefinition.Resolution,GaeaDefinition.ScaleY * 100 / GaeaDefinition.Resolution,GaeaDefinition.Height * 100 / 512); // Apply scaling formula to our passed in scale variable from the ImporterPanelSettings
 
 				constexpr bool bSingleFile = true;
@@ -247,13 +290,20 @@ void UGaeaSubsystem::ReimportGaeaTerrain()
 					// Loop through all layers associated with the landscape and get the relevant layer objects.
 					for (const FLandscapeInfoLayerSettings& LayerSettings : LandscapeActorInfo->Layers)
 					{
-						if (ULandscapeLayerInfoObject* LayerInfoObject = LayerSettings.LayerInfoObj)
+						if (ULandscapeLayerInfoObject* LayerInfoObject = LayerSettings.LayerInfoObj;
+						LayerInfoObject && LayerInfoObject != ALandscapeProxy::VisibilityLayer)
 						{
 							InfoObjects.Add(LayerInfoObject);
 							
 						}
 					}
 					
+					// PostLoad adds Visibility; only material paint layers consume Gaea weightmaps.
+					if (InfoObjects.IsEmpty() || GaeaComponent->WeightmapFilepaths.Num() < InfoObjects.Num() - 1)
+					{
+						UE_LOG(GaeaSubsystem, Warning, TEXT("Weightmap reimport requires a base material layer and one file per remaining paint layer; terrain was left unchanged."));
+						return;
+					}
 					if (!InfoObjects.IsEmpty())
 					{
 						// Reimport writes to edit layer 0, not one edit layer per material layer.
@@ -318,7 +368,8 @@ void UGaeaSubsystem::ReimportGaeaTerrain()
 					
 						Landscape->RequestLayersContentUpdateForceAll(ELandscapeLayerUpdateMode::Update_Heightmap_All);
 						
-					Landscape->SetActorScale3D(LandscapeScale);
+					LandscapeEdit.Flush();
+					ApplyReimportScale(Landscape, LandscapeScale);
 					
 					}
 				else
@@ -379,7 +430,6 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 
 					if(bStatus)
 					{
-						FVector LandscapeLocation = FVector(0, 0, GaeaDefinition.Height * 100 / 2);
 						FVector LandscapeScale = FVector(
 							GaeaDefinition.ScaleX * 100 / GaeaDefinition.Resolution,
 							GaeaDefinition.ScaleY * 100 / GaeaDefinition.Resolution,
@@ -437,12 +487,19 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 									// Loop through all layers associated with the landscape and get the relevant layer objects.
 									for (const FLandscapeInfoLayerSettings& LayerSettings : LandscapeActorInfo->Layers)
 									{
-										if (ULandscapeLayerInfoObject* LayerInfoObject = LayerSettings.LayerInfoObj)
+										if (ULandscapeLayerInfoObject* LayerInfoObject = LayerSettings.LayerInfoObj;
+											LayerInfoObject && LayerInfoObject != ALandscapeProxy::VisibilityLayer)
 										{
 											InfoObjects.Add(LayerInfoObject);
 										}
 									}
 
+									// PostLoad adds Visibility; only material paint layers consume Gaea weightmaps.
+									if (InfoObjects.IsEmpty() || GaeaComponent->WeightmapFilepaths.Num() < InfoObjects.Num() - 1)
+									{
+										UE_LOG(GaeaSubsystem, Warning, TEXT("Weightmap reimport requires a base material layer and one file per remaining paint layer; terrain was left unchanged."));
+										return;
+									}
 									if (!InfoObjects.IsEmpty())
 									{
 										// Reimport writes to edit layer 0, not one edit layer per material layer.
@@ -464,6 +521,10 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 
 								for (ALandscapeProxy* Proxy : AllProxies)
 								{
+									if (Proxy->LandscapeComponents.IsEmpty())
+									{
+										continue;
+									}
 									FLandscapeEditDataInterface LandscapeEdit(Proxy->GetLandscapeInfo());
 
 									FIntRect ComponentsRect = Proxy->GetBoundingRect() + Proxy->GetSectionBase();
@@ -507,7 +568,6 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 											Landscape->RequestLayersContentUpdateForceAll(ELandscapeLayerUpdateMode::Update_All);
 										
 										
-										Proxy->SetActorScale3D(LandscapeScale);
 									}
 									else
 									{
@@ -585,6 +645,7 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 									}
 									
 								}
+								ApplyReimportScale(Landscape, LandscapeScale);
 							}
 						}
 					}
