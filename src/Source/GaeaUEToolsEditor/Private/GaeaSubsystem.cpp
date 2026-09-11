@@ -29,7 +29,7 @@
 #include "GaeaLandscapeComponent.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
-#include "AsyncTreeDifferences.h"
+#include "Misc/ScopedSlowTask.h"
 #include "EditorAssetLibrary.h"
 #include "Modules/ModuleManager.h"
 #include "Misc/PackageName.h"
@@ -37,6 +37,8 @@
 #include "Editor.h"
 #include "LandscapeEditLayer.h"
 #include "LandscapeEdit.h"
+#include "Components/SceneComponent.h"
+#include "LandscapeHeightfieldCollisionComponent.h"
 
 
 #include "Materials/MaterialExpressionLandscapeLayerBlend.h"
@@ -46,6 +48,48 @@
 DEFINE_LOG_CATEGORY(GaeaSubsystem)
 
 #define LOCTEXT_NAMESPACE "GaeaSubsystem"
+
+namespace
+{
+void ApplyReimportScale(ALandscape* Landscape, const FVector& NewScale)
+{
+	FTransform Transform = Landscape->GetActorTransform();
+	const bool bScaleChanged = !Transform.GetScale3D().Equals(NewScale);
+	// Landscape sample 0 is local Z=-256. Keep that height datum fixed when
+	// the Gaea height range changes, including any user translation/rotation.
+	const double HeightOffset = (NewScale.Z - Transform.GetScale3D().Z) * 256.0;
+	Transform.AddToTranslation(Transform.GetRotation().RotateVector(FVector(0, 0, HeightOffset)));
+	Transform.SetScale3D(NewScale);
+
+	Landscape->Modify();
+	Landscape->GetRootComponent()->Modify();
+	Landscape->SetActorTransform(Transform);
+	if (ULandscapeInfo* Info = Landscape->GetLandscapeInfo())
+	{
+		Info->DrawScale = Landscape->GetRootComponent()->GetRelativeScale3D();
+		// Streaming proxies are separate actors. Derive their transforms from
+		// the root and section offsets instead of scaling/moving them separately.
+		Info->FixupProxiesTransform(true);
+		if (bScaleChanged)
+		{
+			// Chaos heightfields bake scale into their physics geometry.
+			Info->ForEachLandscapeProxy([](ALandscapeProxy* Proxy)
+			{
+				for (ULandscapeHeightfieldCollisionComponent* Collision : Proxy->CollisionComponents)
+				{
+					if (Collision)
+					{
+						Collision->RecreateCollision();
+					}
+				}
+				return true;
+			});
+		}
+	}
+	GEngine->BroadcastOnActorMoved(Landscape);
+	Landscape->RequestLayersContentUpdateForceAll(ELandscapeLayerUpdateMode::Update_All);
+}
+}
 
 
 UGaeaSubsystem* UGaeaSubsystem::GetGaeaSubsystem()
@@ -156,11 +200,25 @@ void UGaeaSubsystem::ReimportGaeaTerrain()
 	if (UEditorActorSubsystem* ActorSubsystem = GEditor->GetEditorSubsystem<UEditorActorSubsystem>())
 	{
 		const TArray<AActor*>& SelectedActors = ActorSubsystem->GetSelectedLevelActors(); // Use the subsystem instance to get references to selected actors.
-		UGaeaLandscapeComponent* GaeaComponent = SelectedActors[0]->FindComponentByClass<UGaeaLandscapeComponent>(); // Check for a Gaea Landscape Component.
+		if (SelectedActors.IsEmpty() || !IsValid(SelectedActors[0]))
+		{
+			return;
+		}
+		UGaeaLandscapeComponent* GaeaComponent = SelectedActors[0]->FindComponentByClass<UGaeaLandscapeComponent>();
 		if (SelectedActors.Num() > 0 && GaeaComponent) // Check if component is valid and we actually have a selected actor.
 		{
 			AActor* Actor = SelectedActors[0];
 			ALandscape* Landscape = Cast<ALandscape>(Actor);
+			if (!IsValid(Landscape))
+			{
+				return;
+			}
+			ULandscapeEditLayerBase* BaseEditLayer = Landscape->GetEditLayer(0);
+			if (!BaseEditLayer || !Landscape->GetLandscapeInfo())
+			{
+				UE_LOG(GaeaSubsystem, Warning, TEXT("Reimport requires a landscape with a base edit layer."));
+				return;
+			}
 			
 			ULandscapeInfo* LandscapeActorInfo = Landscape->GetLandscapeInfo();
 
@@ -175,7 +233,6 @@ void UGaeaSubsystem::ReimportGaeaTerrain()
 			{
 				UE_LOG(GaeaSubsystem, Display, TEXT("ScaleX: %f, ScaleY: %f, Height: %f, Resolution: %d"), 
 			   GaeaDefinition.ScaleX, GaeaDefinition.ScaleY, GaeaDefinition.Height, GaeaDefinition.Resolution);
-				FVector LandscapeLocation = FVector(0,0,GaeaDefinition.Height*100/2);
 				FVector LandscapeScale = FVector(GaeaDefinition.ScaleX * 100 / GaeaDefinition.Resolution,GaeaDefinition.ScaleY * 100 / GaeaDefinition.Resolution,GaeaDefinition.Height * 100 / 512); // Apply scaling formula to our passed in scale variable from the ImporterPanelSettings
 
 				constexpr bool bSingleFile = true;
@@ -220,8 +277,7 @@ void UGaeaSubsystem::ReimportGaeaTerrain()
 				FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
 				
 				// New setup for 5.6 to get the Guid of the base edit layer. Required for SetEditLayer and therefore SetHeight/Weight Data to function properly.
-				ULandscapeEditLayerBase* Layer = Landscape->GetEditLayer(0);
-				LandscapeEdit.SetEditLayer(Layer->GetGuid()); 
+				LandscapeEdit.SetEditLayer(BaseEditLayer->GetGuid());
 				
 				
 				
@@ -234,21 +290,24 @@ void UGaeaSubsystem::ReimportGaeaTerrain()
 					// Loop through all layers associated with the landscape and get the relevant layer objects.
 					for (const FLandscapeInfoLayerSettings& LayerSettings : LandscapeActorInfo->Layers)
 					{
-						if (ULandscapeLayerInfoObject* LayerInfoObject = LayerSettings.LayerInfoObj)
+						if (ULandscapeLayerInfoObject* LayerInfoObject = LayerSettings.LayerInfoObj;
+						LayerInfoObject && LayerInfoObject != ALandscapeProxy::VisibilityLayer)
 						{
 							InfoObjects.Add(LayerInfoObject);
 							
 						}
 					}
 					
-					for (int32 i = 0; i < InfoObjects.Num(); i++)
+					// PostLoad adds Visibility; only material paint layers consume Gaea weightmaps.
+					if (InfoObjects.IsEmpty() || GaeaComponent->WeightmapFilepaths.Num() < InfoObjects.Num() - 1)
 					{
-						if (InfoObjects[i])
-						{
-							Landscape->ClearEditLayer(i, nullptr, ELandscapeToolTargetTypeFlags::Heightmap);
-							Landscape->ClearEditLayer(i, nullptr, ELandscapeToolTargetTypeFlags::Weightmap);
-							
-						}
+						UE_LOG(GaeaSubsystem, Warning, TEXT("Weightmap reimport requires a base material layer and one file per remaining paint layer; terrain was left unchanged."));
+						return;
+					}
+					if (!InfoObjects.IsEmpty())
+					{
+						// Reimport writes to edit layer 0, not one edit layer per material layer.
+						Landscape->ClearEditLayer(0, nullptr, ELandscapeToolTargetTypeFlags::Weightmap);
 					}
 					
 					WeightOutMessage.AddDefaulted(InfoObjects.Num());
@@ -309,7 +368,8 @@ void UGaeaSubsystem::ReimportGaeaTerrain()
 					
 						Landscape->RequestLayersContentUpdateForceAll(ELandscapeLayerUpdateMode::Update_Heightmap_All);
 						
-					Landscape->SetActorScale3D(LandscapeScale);
+					LandscapeEdit.Flush();
+					ApplyReimportScale(Landscape, LandscapeScale);
 					
 					}
 				else
@@ -345,6 +405,16 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 		{
 			AActor* Actor = SelectedActors[0];
 			ALandscape* Landscape = Cast<ALandscape>(Actor);
+			if (!IsValid(Landscape))
+			{
+				return;
+			}
+			ULandscapeEditLayerBase* BaseEditLayer = Landscape->GetEditLayer(0);
+			if (!BaseEditLayer || !Landscape->GetLandscapeInfo())
+			{
+				UE_LOG(GaeaSubsystem, Warning, TEXT("Reimport requires a landscape with a base edit layer."));
+				return;
+			}
 			ULandscapeInfo* LandscapeActorInfo = Landscape->GetLandscapeInfo();
         	
 			if (Landscape)
@@ -360,7 +430,6 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 
 					if(bStatus)
 					{
-						FVector LandscapeLocation = FVector(0, 0, GaeaDefinition.Height * 100 / 2);
 						FVector LandscapeScale = FVector(
 							GaeaDefinition.ScaleX * 100 / GaeaDefinition.Resolution,
 							GaeaDefinition.ScaleY * 100 / GaeaDefinition.Resolution,
@@ -418,18 +487,23 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 									// Loop through all layers associated with the landscape and get the relevant layer objects.
 									for (const FLandscapeInfoLayerSettings& LayerSettings : LandscapeActorInfo->Layers)
 									{
-										if (ULandscapeLayerInfoObject* LayerInfoObject = LayerSettings.LayerInfoObj)
+										if (ULandscapeLayerInfoObject* LayerInfoObject = LayerSettings.LayerInfoObj;
+											LayerInfoObject && LayerInfoObject != ALandscapeProxy::VisibilityLayer)
 										{
 											InfoObjects.Add(LayerInfoObject);
 										}
 									}
 
-									for (int32 i = 0; i < InfoObjects.Num(); i++)
+									// PostLoad adds Visibility; only material paint layers consume Gaea weightmaps.
+									if (InfoObjects.IsEmpty() || GaeaComponent->WeightmapFilepaths.Num() < InfoObjects.Num() - 1)
 									{
-										if (InfoObjects[i])
-										{
-											Landscape->ClearEditLayer(i,nullptr,ELandscapeToolTargetTypeFlags::Weightmap); // Have to clear all layers, or SetAlphaData will accumulate or present with visual artifacting.
-										}
+										UE_LOG(GaeaSubsystem, Warning, TEXT("Weightmap reimport requires a base material layer and one file per remaining paint layer; terrain was left unchanged."));
+										return;
+									}
+									if (!InfoObjects.IsEmpty())
+									{
+										// Reimport writes to edit layer 0, not one edit layer per material layer.
+										Landscape->ClearEditLayer(0, nullptr, ELandscapeToolTargetTypeFlags::Weightmap);
 									}
 					
 									WeightOutMessage.AddDefaulted(InfoObjects.Num());
@@ -447,6 +521,10 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 
 								for (ALandscapeProxy* Proxy : AllProxies)
 								{
+									if (Proxy->LandscapeComponents.IsEmpty())
+									{
+										continue;
+									}
 									FLandscapeEditDataInterface LandscapeEdit(Proxy->GetLandscapeInfo());
 
 									FIntRect ComponentsRect = Proxy->GetBoundingRect() + Proxy->GetSectionBase();
@@ -476,8 +554,7 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 									if (ProxyHeightData.Num() == CompSizeX * CompSizeY)
 									{
 										
-											ULandscapeEditLayerBase* Layer = Landscape->GetEditLayer(0);
-											LandscapeEdit.SetEditLayer(Layer->GetGuid()); 
+											LandscapeEdit.SetEditLayer(BaseEditLayer->GetGuid());
 											
 											LandscapeEdit.SetHeightData(
 												ComponentsRect.Min.X, ComponentsRect.Min.Y,
@@ -491,7 +568,6 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 											Landscape->RequestLayersContentUpdateForceAll(ELandscapeLayerUpdateMode::Update_All);
 										
 										
-										Proxy->SetActorScale3D(LandscapeScale);
 									}
 									else
 									{
@@ -507,7 +583,7 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 										TArray<uint8> FirstLayerData;
 										FirstLayerData.SetNum(CompSizeX * CompSizeY);
 										FMemory::Memset(FirstLayerData.GetData(), 255, CompSizeX * CompSizeY);
-										LandscapeEdit.SetAlphaData(InfoObjects[0],ComponentsRect.Min.X, ComponentsRect.Min.Y,ComponentsRect.Max.X, ComponentsRect.Max.Y,FirstLayerData.GetData(),0);
+										LandscapeEdit.SetAlphaData(InfoObjects[0],ComponentsRect.Min.X, ComponentsRect.Min.Y,ComponentsRect.Max.X, ComponentsRect.Max.Y,FirstLayerData.GetData(),0,ELandscapeLayerPaintingRestriction::None);
 										
 										for (int32 i = 1; i < InfoObjects.Num(); i++)  // Start from 1 to skip first layer
 										{
@@ -542,8 +618,7 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 												if (ProxyWeightData.Num() == CompSizeX * CompSizeY)
 												{
 													
-														ULandscapeEditLayerBase* Layer = Landscape->GetEditLayer(0);
-														LandscapeEdit.SetEditLayer(Layer->GetGuid()); 
+														LandscapeEdit.SetEditLayer(BaseEditLayer->GetGuid());
 														
 														LandscapeEdit.SetAlphaData(
 															InfoObjects[i], 
@@ -570,6 +645,7 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 									}
 									
 								}
+								ApplyReimportScale(Landscape, LandscapeScale);
 							}
 						}
 					}
@@ -1001,12 +1077,13 @@ void UGaeaSubsystem::CreateLandscapeActor(UImporterPanelSettings* Settings)
 
 	Landscape->RegisterAllComponents();
 	
-	for(int32 i = 0; i < Settings->LandscapeMaterialLayerNames.Num(); i++)
+	// Only register layers that were actually imported. A material can have
+	// layer names even when weightmap import was skipped.
+	for (const FLandscapeImportLayerInfo& ImportLayer : MaterialImportLayers)
 	{
-		if(MaterialImportLayers[i].LayerInfo != nullptr)
+		if (ImportLayer.LayerInfo != nullptr)
 		{
-			// New method introduced in 5.5 to create Target Layers. Without this, weightmap import will not work.
-			Landscape->AddTargetLayer(MaterialImportLayers[i].LayerName, FLandscapeTargetLayerSettings(MaterialImportLayers[i].LayerInfo, MaterialImportLayers[i].SourceFilePath));
+			Landscape->AddTargetLayer(ImportLayer.LayerName, FLandscapeTargetLayerSettings(ImportLayer.LayerInfo, ImportLayer.SourceFilePath));
 		}
 	}
 
