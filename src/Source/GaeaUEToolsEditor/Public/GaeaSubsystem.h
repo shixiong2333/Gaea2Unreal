@@ -1,6 +1,7 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
 #pragma once
+#include "CoreMinimal.h"
 #include "Math/MathFwd.h"
 #include "EditorSubsystem.h"
 #include "Modules/ModuleManager.h"
@@ -22,6 +23,8 @@
 DECLARE_LOG_CATEGORY_EXTERN(GaeaSubsystem, Log, All);
 
 class FJsonObject;
+class SWindow;
+class UMaterialExpressionLandscapeLayerBlend;
 
 USTRUCT()
 struct FGaeaJson
@@ -117,7 +120,6 @@ private:
 	
 	
 };
-
 
 
 

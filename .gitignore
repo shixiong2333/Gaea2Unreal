@@ -72,3 +72,13 @@ Plugins/**/Intermediate/*
 
 # Cache files for the editor to use
 DerivedDataCache/*
+
+# Plugin builds and local packaging output at any nesting level
+**/Binaries/
+**/Intermediate/
+**/Saved/
+**/DerivedDataCache/
+*.pdb
+/PluginBuild/
+/dist/
+__pycache__/

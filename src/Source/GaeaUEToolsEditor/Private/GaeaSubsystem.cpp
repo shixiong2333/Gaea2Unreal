@@ -29,7 +29,7 @@
 #include "GaeaLandscapeComponent.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
-#include "AsyncTreeDifferences.h"
+#include "Misc/ScopedSlowTask.h"
 #include "EditorAssetLibrary.h"
 #include "Modules/ModuleManager.h"
 #include "Misc/PackageName.h"
@@ -156,11 +156,25 @@ void UGaeaSubsystem::ReimportGaeaTerrain()
 	if (UEditorActorSubsystem* ActorSubsystem = GEditor->GetEditorSubsystem<UEditorActorSubsystem>())
 	{
 		const TArray<AActor*>& SelectedActors = ActorSubsystem->GetSelectedLevelActors(); // Use the subsystem instance to get references to selected actors.
-		UGaeaLandscapeComponent* GaeaComponent = SelectedActors[0]->FindComponentByClass<UGaeaLandscapeComponent>(); // Check for a Gaea Landscape Component.
+		if (SelectedActors.IsEmpty() || !IsValid(SelectedActors[0]))
+		{
+			return;
+		}
+		UGaeaLandscapeComponent* GaeaComponent = SelectedActors[0]->FindComponentByClass<UGaeaLandscapeComponent>();
 		if (SelectedActors.Num() > 0 && GaeaComponent) // Check if component is valid and we actually have a selected actor.
 		{
 			AActor* Actor = SelectedActors[0];
 			ALandscape* Landscape = Cast<ALandscape>(Actor);
+			if (!IsValid(Landscape))
+			{
+				return;
+			}
+			ULandscapeEditLayerBase* BaseEditLayer = Landscape->GetEditLayer(0);
+			if (!BaseEditLayer || !Landscape->GetLandscapeInfo())
+			{
+				UE_LOG(GaeaSubsystem, Warning, TEXT("Reimport requires a landscape with a base edit layer."));
+				return;
+			}
 			
 			ULandscapeInfo* LandscapeActorInfo = Landscape->GetLandscapeInfo();
 
@@ -220,8 +234,7 @@ void UGaeaSubsystem::ReimportGaeaTerrain()
 				FLandscapeEditDataInterface LandscapeEdit(Landscape->GetLandscapeInfo());
 				
 				// New setup for 5.6 to get the Guid of the base edit layer. Required for SetEditLayer and therefore SetHeight/Weight Data to function properly.
-				ULandscapeEditLayerBase* Layer = Landscape->GetEditLayer(0);
-				LandscapeEdit.SetEditLayer(Layer->GetGuid()); 
+				LandscapeEdit.SetEditLayer(BaseEditLayer->GetGuid());
 				
 				
 				
@@ -241,14 +254,10 @@ void UGaeaSubsystem::ReimportGaeaTerrain()
 						}
 					}
 					
-					for (int32 i = 0; i < InfoObjects.Num(); i++)
+					if (!InfoObjects.IsEmpty())
 					{
-						if (InfoObjects[i])
-						{
-							Landscape->ClearEditLayer(i, nullptr, ELandscapeToolTargetTypeFlags::Heightmap);
-							Landscape->ClearEditLayer(i, nullptr, ELandscapeToolTargetTypeFlags::Weightmap);
-							
-						}
+						// Reimport writes to edit layer 0, not one edit layer per material layer.
+						Landscape->ClearEditLayer(0, nullptr, ELandscapeToolTargetTypeFlags::Weightmap);
 					}
 					
 					WeightOutMessage.AddDefaulted(InfoObjects.Num());
@@ -345,6 +354,16 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 		{
 			AActor* Actor = SelectedActors[0];
 			ALandscape* Landscape = Cast<ALandscape>(Actor);
+			if (!IsValid(Landscape))
+			{
+				return;
+			}
+			ULandscapeEditLayerBase* BaseEditLayer = Landscape->GetEditLayer(0);
+			if (!BaseEditLayer || !Landscape->GetLandscapeInfo())
+			{
+				UE_LOG(GaeaSubsystem, Warning, TEXT("Reimport requires a landscape with a base edit layer."));
+				return;
+			}
 			ULandscapeInfo* LandscapeActorInfo = Landscape->GetLandscapeInfo();
         	
 			if (Landscape)
@@ -424,12 +443,10 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 										}
 									}
 
-									for (int32 i = 0; i < InfoObjects.Num(); i++)
+									if (!InfoObjects.IsEmpty())
 									{
-										if (InfoObjects[i])
-										{
-											Landscape->ClearEditLayer(i,nullptr,ELandscapeToolTargetTypeFlags::Weightmap); // Have to clear all layers, or SetAlphaData will accumulate or present with visual artifacting.
-										}
+										// Reimport writes to edit layer 0, not one edit layer per material layer.
+										Landscape->ClearEditLayer(0, nullptr, ELandscapeToolTargetTypeFlags::Weightmap);
 									}
 					
 									WeightOutMessage.AddDefaulted(InfoObjects.Num());
@@ -476,8 +493,7 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 									if (ProxyHeightData.Num() == CompSizeX * CompSizeY)
 									{
 										
-											ULandscapeEditLayerBase* Layer = Landscape->GetEditLayer(0);
-											LandscapeEdit.SetEditLayer(Layer->GetGuid()); 
+											LandscapeEdit.SetEditLayer(BaseEditLayer->GetGuid());
 											
 											LandscapeEdit.SetHeightData(
 												ComponentsRect.Min.X, ComponentsRect.Min.Y,
@@ -507,7 +523,7 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 										TArray<uint8> FirstLayerData;
 										FirstLayerData.SetNum(CompSizeX * CompSizeY);
 										FMemory::Memset(FirstLayerData.GetData(), 255, CompSizeX * CompSizeY);
-										LandscapeEdit.SetAlphaData(InfoObjects[0],ComponentsRect.Min.X, ComponentsRect.Min.Y,ComponentsRect.Max.X, ComponentsRect.Max.Y,FirstLayerData.GetData(),0);
+										LandscapeEdit.SetAlphaData(InfoObjects[0],ComponentsRect.Min.X, ComponentsRect.Min.Y,ComponentsRect.Max.X, ComponentsRect.Max.Y,FirstLayerData.GetData(),0,ELandscapeLayerPaintingRestriction::None);
 										
 										for (int32 i = 1; i < InfoObjects.Num(); i++)  // Start from 1 to skip first layer
 										{
@@ -542,8 +558,7 @@ void UGaeaSubsystem::ReimportGaeaWPTerrain()
 												if (ProxyWeightData.Num() == CompSizeX * CompSizeY)
 												{
 													
-														ULandscapeEditLayerBase* Layer = Landscape->GetEditLayer(0);
-														LandscapeEdit.SetEditLayer(Layer->GetGuid()); 
+														LandscapeEdit.SetEditLayer(BaseEditLayer->GetGuid());
 														
 														LandscapeEdit.SetAlphaData(
 															InfoObjects[i], 
@@ -1001,12 +1016,13 @@ void UGaeaSubsystem::CreateLandscapeActor(UImporterPanelSettings* Settings)
 
 	Landscape->RegisterAllComponents();
 	
-	for(int32 i = 0; i < Settings->LandscapeMaterialLayerNames.Num(); i++)
+	// Only register layers that were actually imported. A material can have
+	// layer names even when weightmap import was skipped.
+	for (const FLandscapeImportLayerInfo& ImportLayer : MaterialImportLayers)
 	{
-		if(MaterialImportLayers[i].LayerInfo != nullptr)
+		if (ImportLayer.LayerInfo != nullptr)
 		{
-			// New method introduced in 5.5 to create Target Layers. Without this, weightmap import will not work.
-			Landscape->AddTargetLayer(MaterialImportLayers[i].LayerName, FLandscapeTargetLayerSettings(MaterialImportLayers[i].LayerInfo, MaterialImportLayers[i].SourceFilePath));
+			Landscape->AddTargetLayer(ImportLayer.LayerName, FLandscapeTargetLayerSettings(ImportLayer.LayerInfo, ImportLayer.SourceFilePath));
 		}
 	}
 

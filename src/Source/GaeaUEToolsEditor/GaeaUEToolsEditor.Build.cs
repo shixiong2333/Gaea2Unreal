@@ -1,4 +1,4 @@
-﻿using System.IO;
+using System.IO;
 using UnrealBuildTool;
 
 public class GaeaUEToolsEditor : ModuleRules
@@ -18,31 +18,25 @@ public class GaeaUEToolsEditor : ModuleRules
         PublicDependencyModuleNames.AddRange(
             new string[]
             {
-                "Core", "Landscape", "EditorStyle",
+                "Core", "CoreUObject", "Engine", "Landscape", "Slate", "SlateCore",
+                "EditorSubsystem", "LandscapeEditor", "PropertyEditor", "DesktopPlatform",
             }
         );
 
         PrivateDependencyModuleNames.AddRange(
             new string[]
             {
-                "CoreUObject",
-                "Engine",
-                "Slate",
-                "SlateCore",
                 "InputCore",
                 "LevelEditor",
                 "Projects",
                 "MaterialEditor", 
-                "Landscape", 
                 "UnrealEd", 
                 "ToolMenus", 
                 "EditorFramework",
-                "EditorSubsystem", 
-                "LandscapeEditor",
                 "Foliage",
                 "Json",
                 "JsonUtilities",
-                "AssetRegistry", "EditorScriptingUtilities"
+                "AssetRegistry", "EditorScriptingUtilities", "AssetTools"
             }
         );
     }
